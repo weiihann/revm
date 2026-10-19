@@ -61,10 +61,9 @@ pub struct AccountInfo {
     ///
     /// By default, this is `Some(Bytecode::default())`.
     pub code: Option<Bytecode>,
-    /// Code length recorded while `code` was absent or before it was dropped.
-    ///
-    /// Read it through [`Self::known_code_size`]: the record only counts while its hash matches
-    /// `code_hash`. Not part of equality, hashing, ordering or serde.
+    /// The length of the code at `code_hash` when recorded. Read it through
+    /// [`Self::known_code_size`], which ignores a record tied to another hash. Not part of
+    /// equality, hashing, ordering or serde.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub code_size: Option<CodeSize>,
 }
@@ -152,7 +151,6 @@ impl AccountInfo {
         self
     }
 
-    /// The known code length as a record tied to `code_hash`, so it survives dropping `code`.
     #[inline]
     fn retained_code_size(&self) -> Option<CodeSize> {
         self.known_code_size()
