@@ -2,8 +2,39 @@ use bytecode::Bytecode;
 use core::{
     cmp::Ordering,
     hash::{Hash, Hasher},
+    num::NonZeroU64,
 };
 use primitives::{OnceLock, B256, KECCAK_EMPTY, U256};
+
+/// Byte length of an account's code, tied to the hash it was measured under.
+///
+/// Code outside this crate rewrites `code_hash` in place, so a bare length could go stale. Tying
+/// it to the hash makes a stale record read as unknown instead of wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CodeSize {
+    code_hash: B256,
+    len: NonZeroU64,
+}
+
+impl CodeSize {
+    /// Ties `len` to `code_hash`. `None` for the empty code hash or a zero length.
+    #[inline]
+    pub fn new(code_hash: B256, len: u64) -> Option<Self> {
+        if code_hash == KECCAK_EMPTY {
+            return None;
+        }
+        Some(Self {
+            code_hash,
+            len: NonZeroU64::new(len)?,
+        })
+    }
+
+    /// The length, only if it was measured under `code_hash`.
+    #[inline]
+    pub fn len_for(&self, code_hash: B256) -> Option<u64> {
+        (self.code_hash == code_hash).then_some(self.len.get())
+    }
+}
 
 /// Account information that contains balance, nonce, code hash and code
 ///
@@ -30,6 +61,12 @@ pub struct AccountInfo {
     ///
     /// By default, this is `Some(Bytecode::default())`.
     pub code: Option<Bytecode>,
+    /// Code length recorded while `code` was absent or before it was dropped.
+    ///
+    /// Read it through [`Self::known_code_size`]: the record only counts while its hash matches
+    /// `code_hash`. Not part of equality, hashing, ordering or serde.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub code_size: Option<CodeSize>,
 }
 
 impl Default for AccountInfo {
@@ -42,6 +79,7 @@ impl Default for AccountInfo {
                 account_id: None,
                 nonce: 0,
                 code: Some(Bytecode::default()),
+                code_size: None,
             })
             .clone()
     }
@@ -88,7 +126,37 @@ impl AccountInfo {
             code: Some(code),
             code_hash,
             account_id: None,
+            code_size: None,
         }
+    }
+
+    /// Returns the code length without reading bytecode, or `None` if it is unknown.
+    ///
+    /// The empty code hash gives `0`, present non-empty code gives its length, and otherwise a
+    /// recorded [`CodeSize`] counts only if it was measured under the current `code_hash`.
+    #[inline]
+    pub fn known_code_size(&self) -> Option<u64> {
+        if self.code_hash == KECCAK_EMPTY {
+            return Some(0);
+        }
+        if let Some(code) = self.code.as_ref().filter(|code| !code.is_empty()) {
+            return Some(code.len() as u64);
+        }
+        self.code_size.and_then(|size| size.len_for(self.code_hash))
+    }
+
+    /// Records `len` as the code length under the current `code_hash`; `None` clears it.
+    #[inline]
+    pub fn with_code_size(mut self, len: Option<u64>) -> Self {
+        self.code_size = len.and_then(|len| CodeSize::new(self.code_hash, len));
+        self
+    }
+
+    /// The known code length as a record tied to `code_hash`, so it survives dropping `code`.
+    #[inline]
+    fn retained_code_size(&self) -> Option<CodeSize> {
+        self.known_code_size()
+            .and_then(|len| CodeSize::new(self.code_hash, len))
     }
 
     /// Creates a new [`AccountInfo`] with the given code.
@@ -211,6 +279,7 @@ impl AccountInfo {
             code_hash: self.code_hash,
             account_id: self.account_id,
             code: None,
+            code_size: self.retained_code_size(),
         }
     }
 
@@ -274,6 +343,7 @@ impl AccountInfo {
     /// Code will be set to [None].
     #[inline]
     pub fn take_bytecode(&mut self) -> Option<Bytecode> {
+        self.code_size = self.retained_code_size();
         self.code.take()
     }
 
@@ -299,16 +369,111 @@ impl AccountInfo {
             code: Some(bytecode),
             code_hash: hash,
             account_id: None,
+            code_size: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::AccountInfo;
+    use crate::{AccountInfo, CodeSize};
     use bytecode::Bytecode;
-    use core::cmp::Ordering;
-    use std::collections::BTreeSet;
+    use core::{
+        cmp::Ordering,
+        hash::{Hash, Hasher},
+    };
+    use primitives::{Bytes, B256, KECCAK_EMPTY};
+    use std::collections::{hash_map::DefaultHasher, BTreeSet};
+
+    fn contract() -> AccountInfo {
+        AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x60, 0x00,
+        ])))
+    }
+
+    #[test]
+    fn known_code_size_rules() {
+        let hash = B256::repeat_byte(0x11);
+
+        assert_eq!(AccountInfo::default().known_code_size(), Some(0));
+        assert_eq!(
+            AccountInfo::default()
+                .with_code_size(Some(7))
+                .known_code_size(),
+            Some(0),
+            "empty code hash wins over any record"
+        );
+        assert_eq!(contract().known_code_size(), Some(4));
+
+        let mut recorded = AccountInfo::default()
+            .with_code_hash(hash)
+            .with_code_size(Some(7));
+        assert_eq!(recorded.known_code_size(), Some(7));
+        recorded.code_hash = B256::repeat_byte(0x22);
+        assert_eq!(recorded.known_code_size(), None, "stale tag reads unknown");
+
+        let unrecorded = AccountInfo::default().with_code_hash(hash);
+        assert_eq!(unrecorded.known_code_size(), None);
+        assert_eq!(
+            unrecorded.clone().with_code_size(Some(0)).known_code_size(),
+            None
+        );
+        assert_eq!(
+            AccountInfo::default()
+                .with_code_hash(hash)
+                .with_code_size(Some(7))
+                .with_code_size(None)
+                .known_code_size(),
+            None
+        );
+
+        assert_eq!(CodeSize::new(KECCAK_EMPTY, 7), None);
+        assert_eq!(CodeSize::new(hash, 0), None);
+        assert_eq!(CodeSize::new(hash, 7).unwrap().len_for(hash), Some(7));
+        assert_eq!(
+            CodeSize::new(hash, 7)
+                .unwrap()
+                .len_for(B256::repeat_byte(0x22)),
+            None
+        );
+    }
+
+    #[test]
+    fn dropping_code_keeps_code_size() {
+        let copy = contract().copy_without_code();
+        assert!(copy.code.is_none());
+        assert_eq!(copy.known_code_size(), Some(4));
+
+        let stripped = contract().without_code();
+        assert!(stripped.code.is_none());
+        assert_eq!(stripped.known_code_size(), Some(4));
+
+        let mut taken = contract();
+        assert!(taken.take_bytecode().is_some());
+        assert_eq!(taken.known_code_size(), Some(4));
+
+        taken.code_hash = B256::repeat_byte(0x22);
+        assert_eq!(taken.known_code_size(), None);
+    }
+
+    #[test]
+    fn code_size_is_not_identity() {
+        let hash = B256::repeat_byte(0x11);
+        let with_size = AccountInfo::default()
+            .with_code_hash(hash)
+            .with_code_size(Some(7));
+        let without_size = AccountInfo::default().with_code_hash(hash);
+
+        assert_eq!(with_size, without_size);
+        assert_eq!(with_size.cmp(&without_size), Ordering::Equal);
+
+        let digest = |info: &AccountInfo| {
+            let mut hasher = DefaultHasher::new();
+            info.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(digest(&with_size), digest(&without_size));
+    }
 
     #[test]
     fn test_account_info_trait_consistency() {

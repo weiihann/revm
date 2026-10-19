@@ -678,6 +678,7 @@ fn execute_blockchain_test(
             code_hash: revm::primitives::keccak256(&account.code),
             code: Some(Bytecode::new_raw(account.code.clone())),
             account_id: None,
+            code_size: None,
         };
 
         // Store for debug info
